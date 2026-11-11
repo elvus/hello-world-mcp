@@ -1,0 +1,16 @@
+{
+  "name": "hello-world-mcp",
+  "version": "1.0.0",
+  "description": "A minimal hello world MCP server over streamable HTTP",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "inspect": "npx -y @modelcontextprotocol/inspector"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^3.25.76"
+  },
+  "license": "MIT"
+}
