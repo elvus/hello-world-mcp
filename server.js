@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 import http from "node:http";
-import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -73,9 +71,6 @@ function createServer() {
   return server;
 }
 
-/** sessionId -> transport */
-const transports = new Map();
-
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -112,64 +107,51 @@ const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host ?? "localhost"}`);
 
   if (url.pathname === "/health") {
-    return sendJson(res, 200, { status: "ok", sessions: transports.size });
+    return sendJson(res, 200, { status: "ok", mode: "stateless" });
   }
 
   if (url.pathname !== MCP_PATH) {
     return sendJson(res, 404, jsonRpcError(-32004, "Not found"));
   }
 
-  const sessionId = req.headers["mcp-session-id"];
-
   try {
-    // POST: client -> server messages (initialize, requests, notifications)
+    // POST: client -> server messages. Stateless: every request gets its own
+    // McpServer + transport, both discarded once the response is done. No
+    // Mcp-Session-Id is issued, and clients need not send one.
     if (req.method === "POST") {
       const body = await readBody(req);
 
-      let transport;
-      if (sessionId && transports.has(sessionId)) {
-        transport = transports.get(sessionId);
-      } else if (!sessionId && isInitializeRequest(body)) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          // Guards against DNS-rebinding attacks from a browser on this machine.
-          enableDnsRebindingProtection: true,
-          allowedHosts: ALLOWED_HOSTS,
-          onsessioninitialized: (id) => {
-            transports.set(id, transport);
-            console.error(`session opened: ${id}`);
-          },
-          onsessionclosed: (id) => {
-            transports.delete(id);
-            console.error(`session closed: ${id}`);
-          },
-        });
+      const transport = new StreamableHTTPServerTransport({
+        // `undefined` (not a function returning undefined) is what puts the
+        // SDK transport into stateless mode.
+        sessionIdGenerator: undefined,
+        // Guards against DNS-rebinding attacks from a browser on this machine.
+        enableDnsRebindingProtection: true,
+        allowedHosts: ALLOWED_HOSTS,
+      });
 
-        transport.onclose = () => {
-          if (transport.sessionId) transports.delete(transport.sessionId);
-        };
+      const server = createServer();
 
-        await createServer().connect(transport);
-      } else {
-        return sendJson(
-          res,
-          400,
-          jsonRpcError(-32000, "Bad Request: no valid session ID provided")
-        );
-      }
+      res.on("close", () => {
+        transport.close().catch(() => {});
+        server.close().catch(() => {});
+      });
 
+      await server.connect(transport);
       return await transport.handleRequest(req, res, body);
     }
 
-    // GET: server -> client SSE stream. DELETE: terminate the session.
+    // No sessions to stream over or terminate.
     if (req.method === "GET" || req.method === "DELETE") {
-      if (!sessionId || !transports.has(sessionId)) {
-        return sendJson(res, 400, jsonRpcError(-32000, "Invalid or missing session ID"));
-      }
-      return await transports.get(sessionId).handleRequest(req, res);
+      res.setHeader("Allow", "POST");
+      return sendJson(
+        res,
+        405,
+        jsonRpcError(-32000, "Method not allowed: this server is stateless")
+      );
     }
 
-    res.writeHead(405, { Allow: "GET, POST, DELETE" }).end();
+    res.writeHead(405, { Allow: "POST" }).end();
   } catch (err) {
     console.error("request error:", err);
     if (!res.headersSent) {
@@ -180,14 +162,11 @@ const httpServer = http.createServer(async (req, res) => {
 
 httpServer.listen(PORT, HOST, () => {
   console.error(`hello-world-mcp listening on http://${HOST}:${PORT}${MCP_PATH}`);
-  console.error(`allowed hosts: ${ALLOWED_HOSTS.join(", ")}`);
+  console.error(`mode: stateless · allowed hosts: ${ALLOWED_HOSTS.join(", ")}`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, async () => {
-    for (const transport of transports.values()) {
-      await transport.close().catch(() => {});
-    }
+  process.on(signal, () => {
     httpServer.close(() => process.exit(0));
   });
 }
